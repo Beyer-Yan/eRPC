@@ -101,7 +101,7 @@ class Rpc {
    * is the zero-based index of that port among active ports, as listed by
    * `ibv_devinfo` for Raw, InfiniBand, and RoCE transports; or by
    * `dpdk-devbind` for DPDK transport.
-   * 
+   *
    * @throw runtime_error if construction fails
    */
   Rpc(Nexus *nexus, void *context, uint8_t rpc_id, sm_handler_t sm_handler,
@@ -112,7 +112,7 @@ class Rpc {
 
   /**
    * @brief Create a hugepage-backed buffer for storing request or response
-   * messages.
+   * messages. Safe to call from background threads (TS).
    *
    * @param max_data_size If this call is successful, the returned MsgBuffer
    * contains space for this many application data bytes. The MsgBuffer should
@@ -152,7 +152,8 @@ class Rpc {
   }
 
   /**
-   * @brief Resize a MsgBuffer to fit a request or response
+   * @brief Resize a MsgBuffer to fit a request or response. Safe to call from
+   * background threads (TS).
    *
    * @param msg_buffer The MsgBuffer to resize
    *
@@ -164,7 +165,6 @@ class Rpc {
    */
   static inline void resize_msg_buffer(MsgBuffer *msg_buffer,
                                        size_t new_data_size) {
-    assert(msg_buffer->is_valid());  // Can be fake
     assert(new_data_size <= msg_buffer->max_data_size);
 
     // Avoid division for single-packet data sizes
@@ -172,7 +172,8 @@ class Rpc {
     msg_buffer->resize(new_data_size, new_num_pkts);
   }
 
-  /// Free a MsgBuffer created by alloc_msg_buffer()
+  /// Free a MsgBuffer created by alloc_msg_buffer(). Safe to call from
+  /// background threads (TS).
   inline void free_msg_buffer(MsgBuffer msg_buffer) {
     lock_cond(&huge_alloc_lock);
     huge_alloc->free_buf(msg_buffer.buffer);
@@ -211,7 +212,8 @@ class Rpc {
 
   /**
    * @brief Enqueue a request for transmission. This always succeeds. eRPC owns
-   * \p msg_buffer until it invokes the continuation callback.
+   * \p msg_buffer until it invokes the continuation callback. This function is
+   * safe to call from background threads (TS).
    *
    * @param session_num The session number to send the request on. This session
    * must be connected.
@@ -243,7 +245,8 @@ class Rpc {
   /**
    * @brief Enqueue a response for transmission at the server. See ReqHandle
    * for details about creating the response. On calling this, the application
-   * loses ownership of the request and response MsgBuffer.
+   * loses ownership of the request and response MsgBuffer. This function is
+   * safe to call from background threads (TS).
    *
    * This can be called outside the request handler.
    *
@@ -319,7 +322,8 @@ class Rpc {
   /// Return the Timing Wheel for this Rpc. Expert use only.
   TimingWheel *get_wheel() { return wheel; }
 
-  /// Set this Rpc's context
+  /// Set this Rpc's optaque context, which is passed to request handlers and
+  /// continuations.
   inline void set_context(void *_context) {
     rt_assert(context == nullptr, "Cannot reset non-null Rpc context");
     context = _context;
@@ -606,6 +610,12 @@ class Rpc {
   // Datapath processing
   //
 
+  /// Implementation of the run_event_loop(timeout) API function
+  void run_event_loop_timeout_st(size_t timeout_ms);
+
+  /// Actually run one iteration of the event loop
+  void run_event_loop_do_one_st();
+
   /// Enqueue client packets for a sslot that has at least one credit and
   /// request packets to send. Packets may be added to the timing wheel or the
   /// TX burst; credits are used in both cases.
@@ -629,21 +639,34 @@ class Rpc {
    */
   void process_resp_one_st(SSlot *, const pkthdr_t *, size_t rx_tsc);
 
-  //
-  // Event loop
-  //
+  /**
+   * @brief Enqueue an explicit credit return
+   *
+   * @param sslot The session slot to send the explicit CR for
+   * @param req_pkthdr The packet header of the request packet that triggered
+   * this explicit CR. The packet number of req_pkthdr is copied to the CR.
+   */
+  void enqueue_cr_st(SSlot *sslot, const pkthdr_t *req_pkthdr);
 
-  /// Implementation of the run_event_loop(timeout) API function
-  void run_event_loop_timeout_st(size_t timeout_ms);
+  /**
+   * @brief Process an explicit credit return packet
+   * @param rx_tsc Timestamp at which the packet was received
+   */
+  void process_expl_cr_st(SSlot *, const pkthdr_t *, size_t rx_tsc);
 
-  /// Actually run one iteration of the event loop
-  void run_event_loop_do_one_st();
+  /**
+   * @brief Enqueue a request-for-response. This doesn't modify credits or
+   * sslot's num_tx.
+   *
+   * @param sslot The session slot to send the RFR for
+   * @param req_pkthdr The packet header of the response packet that triggered
+   * this RFR. Since one response packet can trigger multiple RFRs, the RFR's
+   * packet number should be computed from num_tx, not from resp_pkthdr.
+   */
+  void enqueue_rfr_st(SSlot *sslot, const pkthdr_t *resp_pkthdr);
 
-  /// Return true iff a packet should be dropped
-  inline bool roll_pkt_drop() {
-    static constexpr uint32_t billion = 1000000000;
-    return ((fast_rand.next_u32() % billion) < faults.pkt_drop_thresh_billion);
-  }
+  /// Process a request-for-response
+  void process_rfr_st(SSlot *, const pkthdr_t *);
 
   /**
    * @brief Enqueue a data packet from sslot's tx_msgbuf for tx_burst
@@ -653,7 +676,6 @@ class Rpc {
                                       size_t *tx_ts) {
     assert(in_dispatch());
     const MsgBuffer *tx_msgbuf = sslot->tx_msgbuf;
-    assert(tx_msgbuf->is_req() || tx_msgbuf->is_resp());
 
     Transport::tx_burst_item_t &item = tx_burst_arr[tx_batch_i];
     item.routing_info = sslot->session->remote_routing_info;
@@ -681,7 +703,6 @@ class Rpc {
   inline void enqueue_hdr_tx_burst_st(SSlot *sslot, MsgBuffer *ctrl_msgbuf,
                                       size_t *tx_ts) {
     assert(in_dispatch());
-    assert(ctrl_msgbuf->is_expl_cr() || ctrl_msgbuf->is_rfr());
 
     Transport::tx_burst_item_t &item = tx_burst_arr[tx_batch_i];
     item.routing_info = sslot->session->remote_routing_info;
@@ -762,15 +783,15 @@ class Rpc {
   }
 
   /// Return a credit to this session
-  inline void bump_credits(Session *session) {
+  static inline void bump_credits(Session *session) {
     assert(session->is_client());
     assert(session->client_info.credits < kSessionCredits);
     session->client_info.credits++;
   }
 
   /// Copy the data from a packet to a MsgBuffer at a packet index
-  inline void copy_data_to_msgbuf(MsgBuffer *msgbuf, size_t pkt_idx,
-                                  const pkthdr_t *pkthdr) {
+  static inline void copy_data_to_msgbuf(MsgBuffer *msgbuf, size_t pkt_idx,
+                                         const pkthdr_t *pkthdr) {
     size_t offset = pkt_idx * TTr::kMaxDataPerPkt;
     size_t to_copy = std::min(TTr::kMaxDataPerPkt, pkthdr->msg_size - offset);
     memcpy(&msgbuf->buf[offset], pkthdr + 1, to_copy);  // From end of pkthdr
@@ -878,34 +899,11 @@ class Rpc {
     sslot->session->client_info.cc.timely.update_rate(rx_tsc, rtt_tsc);
   }
 
-  /**
-   * @brief Enqueue an explicit credit return
-   *
-   * @param sslot The session slot to send the explicit CR for
-   * @param req_pkthdr The packet header of the request packet that triggered
-   * this explicit CR. The packet number of req_pkthdr is copied to the CR.
-   */
-  void enqueue_cr_st(SSlot *sslot, const pkthdr_t *req_pkthdr);
-
-  /**
-   * @brief Process an explicit credit return packet
-   * @param rx_tsc Timestamp at which the packet was received
-   */
-  void process_expl_cr_st(SSlot *, const pkthdr_t *, size_t rx_tsc);
-
-  /**
-   * @brief Enqueue a request-for-response. This doesn't modify credits or
-   * sslot's num_tx.
-   *
-   * @param sslot The session slot to send the RFR for
-   * @param req_pkthdr The packet header of the response packet that triggered
-   * this RFR. Since one response packet can trigger multiple RFRs, the RFR's
-   * packet number should be computed from num_tx, not from resp_pkthdr.
-   */
-  void enqueue_rfr_st(SSlot *sslot, const pkthdr_t *resp_pkthdr);
-
-  /// Process a request-for-response
-  void process_rfr_st(SSlot *, const pkthdr_t *);
+  /// Return true iff a packet should be dropped
+  inline bool roll_pkt_drop() {
+    static constexpr uint32_t billion = 1000000000;
+    return ((fast_rand.next_u32() % billion) < faults.pkt_drop_thresh_billion);
+  }
 
  public:
   // Hooks for apps to modify eRPC behavior

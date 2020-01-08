@@ -131,18 +131,21 @@ void Rpc<TTr>::process_small_req_st(SSlot *sslot, pkthdr_t *pkthdr) {
   sslot->server_info.req_func_type = req_func.req_func_type;
 
   if (likely(!req_func.is_background())) {
-    // For foreground request handlers, a "fake" static request MsgBuffer
-    // suffices -- it's valid for the duration of req_func().
-    req_msgbuf = MsgBuffer(pkthdr, pkthdr->msg_size);
+    if (kZeroCopyRX) {
+      // For foreground request handlers, a "fake" static request msgbuf
+      // suffices. This improves performance, but it restricts ownership of the
+      // request msgbuf to the duration of req_func.
+      req_msgbuf = MsgBuffer(pkthdr, pkthdr->msg_size);
+    } else {
+      req_msgbuf = alloc_msg_buffer(pkthdr->msg_size);
+      memcpy(req_msgbuf.buf, pkthdr + 1, pkthdr->msg_size);  // Omit header
+    }
     req_func.req_func(static_cast<ReqHandle *>(sslot), context);
     return;
   } else {
-    // For background request handlers, we need a RX ring--independent copy of
-    // the request. The allocated req_msgbuf is freed by the background thread.
+    // Background request handlers need an RX ring--independent request copy
     req_msgbuf = alloc_msg_buffer(pkthdr->msg_size);
-    assert(req_msgbuf.buf != nullptr);
-    memcpy(req_msgbuf.get_pkthdr_0(), pkthdr,
-           pkthdr->msg_size + sizeof(pkthdr_t));
+    memcpy(req_msgbuf.buf, pkthdr + 1, pkthdr->msg_size);  // Omit header
     submit_bg_req_st(sslot);
     return;
   }
@@ -151,7 +154,6 @@ void Rpc<TTr>::process_small_req_st(SSlot *sslot, pkthdr_t *pkthdr) {
 template <class TTr>
 void Rpc<TTr>::process_large_req_one_st(SSlot *sslot, const pkthdr_t *pkthdr) {
   assert(in_dispatch());
-  MsgBuffer &req_msgbuf = sslot->server_info.req_msgbuf;
 
   // Handle reordering
   bool is_next_pkt_same_req =  // Is this the next packet in this request?
@@ -201,6 +203,8 @@ void Rpc<TTr>::process_large_req_one_st(SSlot *sslot, const pkthdr_t *pkthdr) {
     return;
   }
 
+  MsgBuffer &req_msgbuf = sslot->server_info.req_msgbuf;
+
   // Allocate or locate the request MsgBuffer
   if (pkthdr->pkt_num == 0) {
     // This is the first packet received for this request
@@ -212,7 +216,6 @@ void Rpc<TTr>::process_large_req_one_st(SSlot *sslot, const pkthdr_t *pkthdr) {
 
     req_msgbuf = alloc_msg_buffer(pkthdr->msg_size);
     assert(req_msgbuf.buf != nullptr);
-    *(req_msgbuf.get_pkthdr_0()) = *pkthdr;
 
     // Update sslot tracking
     sslot->cur_req_num = pkthdr->req_num;
@@ -225,8 +228,7 @@ void Rpc<TTr>::process_large_req_one_st(SSlot *sslot, const pkthdr_t *pkthdr) {
   // Send a credit return for every request packet except the last in sequence
   if (pkthdr->pkt_num != req_msgbuf.num_pkts - 1) enqueue_cr_st(sslot, pkthdr);
 
-  // Header 0 was copied earlier. Request packet's index = packet number.
-  copy_data_to_msgbuf(&req_msgbuf, pkthdr->pkt_num, pkthdr);
+  copy_data_to_msgbuf(&req_msgbuf, pkthdr->pkt_num, pkthdr);  // Omits header
 
   // Invoke the request handler iff we have all the request packets
   if (sslot->server_info.num_rx != req_msgbuf.num_pkts) return;

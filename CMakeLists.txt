@@ -4,8 +4,7 @@ project(eRPC)
 include(CMakeDependentOption)
 
 # Pick a compiler
-#set(CMAKE_CXX_COMPILER clang++-6.0)
-#set(CMAKE_CXX_COMPILER g++-8)
+#set(CMAKE_CXX_COMPILER clang++)
 set(CMAKE_CXX_COMPILER g++)
 
 add_definitions(-std=c++11 -march=native -g)
@@ -27,6 +26,10 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/build)
 
 # liberpc will be compiled unless profile-guided optimization or LTO is enabled
 set(COMPILE_ERPC_LIB ON)
+
+# DPDK may be needed for different reasons (e.g., the transport is DPDK, or
+# if the transport is not DPDK but the application needs DPDK libraries)
+set(DPDK_NEEDED "false")
 
 # Options exposed to the user
 set(TRANSPORT "dpdk" CACHE STRING "Datapath transport (infiniband/raw/dpdk)")
@@ -100,10 +103,10 @@ endif(DEBUG)
 # Testing for packet loss, machine failure, etc
 if(TESTING)
   message(STATUS "Testing is enabled. Performance will be low.")
-  add_definitions(-DTESTING=true)
+  add_definitions(-DERPC_TESTING=true)
 else(TESTING)
   message(STATUS "Testing is disabled, so tests may fail.")
-  add_definitions(-DTESTING=false)
+  add_definitions(-DERPC_TESTING=false)
 endif(TESTING)
 
 # Link-time optimization
@@ -144,6 +147,7 @@ set(SOURCES
   src/transport_impl/raw/raw_transport.cc
   src/transport_impl/raw/raw_transport_datapath.cc
   src/util/huge_alloc.cc
+  src/util/externs.cc
   src/util/tls_registry.cc)
 
 # Boost
@@ -159,30 +163,14 @@ endif()
 # infiniband, but they do not play well with DPDK. So we compile only one
 # transport. Other transports are exluded using preprocessor macros.
 string(TOUPPER ${TRANSPORT} DEFINE_TRANSPORT)
-add_definitions(-D${DEFINE_TRANSPORT}=true)
+add_definitions(-DERPC_${DEFINE_TRANSPORT}=true)
 message(STATUS "Selected transport = ${TRANSPORT}.")
 set(CONFIG_IS_ROCE false)
 
 if(TRANSPORT STREQUAL "dpdk")
-  find_library(DPDK_LIB dpdk)
-  if(NOT DPDK_LIB)
-    message(FATAL_ERROR "dpdk library not found")
-  endif()
-
-  set(LIBRARIES ${LIBRARIES} dpdk dl)
   set(CONFIG_TRANSPORT "DpdkTransport")
   set(CONFIG_HEADROOM 40)
-
-  # DPDK include directory. Locating rte_config.h does not work on some systems.
-  # Example: it may be kept in /usr/include/x86_64-linux-gnu/, and symlinked
-  # from the real DPDK include directory (/usr/include/dpdk/).
-  find_path(DPDK_INCLUDE_DIR NAMES rte_ethdev.h PATH_SUFFIXES dpdk)
-  if (DPDK_INCLUDE_DIR)
-    message(STATUS "DPDK include directory = ${DPDK_INCLUDE_DIR}")
-  else()
-    message(FATAL_ERROR "DPDK include directory not found. Please install DPDK.")
-  endif()
-  include_directories(SYSTEM ${DPDK_INCLUDE_DIR})
+  set(DPDK_NEEDED "true") # We'll resolve DPDK later
 else()
   find_library(IBVERBS_LIB ibverbs)
   if(NOT IBVERBS_LIB)
@@ -241,6 +229,7 @@ endif()
 # These are not run using ctest
 set(UTIL_TESTS
   huge_alloc_test
+  hugepage_caching_virt2phy_test
   timing_wheel_test
   heartbeat_mgr_test
   rand_test
@@ -324,8 +313,35 @@ elseif(APP STREQUAL "mica_test")
   set(APP_ADDITIONAL_SOURCES ${MICA_SOURCES})
 elseif(APP STREQUAL "latency")
   set(LIBRARIES ${LIBRARIES} ${PMEM})
+elseif(APP STREQUAL "pmem_bw")
+  set(LIBRARIES ${LIBRARIES} ${PMEM})
+  message(STATUS "DPDK is needed for pmem_bw application")
+  add_definitions(-fpermissive)
+  set(DPDK_NEEDED "true")
 elseif(APP STREQUAL "persistent_kv")
   set(LIBRARIES ${LIBRARIES} ${PMEM} cityhash)
+elseif(APP STREQUAL "log")
+  set(LIBRARIES ${LIBRARIES} ${PMEM})
+endif()
+
+if(DPDK_NEEDED STREQUAL "true")
+  find_library(DPDK_LIB dpdk)
+  if(NOT DPDK_LIB)
+    message(FATAL_ERROR "DPDK library not found")
+  endif()
+
+  set(LIBRARIES ${LIBRARIES} -Wl,--whole-archive dpdk -Wl,--no-whole-archive dl)
+
+  # DPDK include directory. Locating rte_config.h does not work on some systems.
+  # Example: it may be kept in /usr/include/x86_64-linux-gnu/, and symlinked
+  # from the real DPDK include directory (/usr/include/dpdk/).
+  find_path(DPDK_INCLUDE_DIR NAMES rte_ethdev.h PATH_SUFFIXES dpdk)
+  if (DPDK_INCLUDE_DIR)
+    message(STATUS "DPDK include directory = ${DPDK_INCLUDE_DIR}")
+  else()
+    message(FATAL_ERROR "DPDK include directory not found")
+  endif()
+  include_directories(SYSTEM ${DPDK_INCLUDE_DIR})
 endif()
 
 # Compile only the one application. If COMPILE_ERPC_LIB is false, we use LTO
